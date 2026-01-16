@@ -1,0 +1,155 @@
+name: dev build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: 'Version suffix for dev build (e.g., dev, alpha, beta)'
+        required: false
+        default: 'dev'
+        type: string
+      skip_notarization:
+        description: 'Skip notarization step'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  build-gitx-dev:
+    name: build dev version
+    runs-on: macos-26
+    permissions:
+      contents: read
+    env:
+      variableSet: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+    strategy:
+      fail-fast: false
+    steps:
+      - name: ls Xcode
+        run: ls -la /Applications/Xcode*
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: 26.2
+      - name: Install the Apple certificate and provisioning profile
+        if: ${{ env.variableSet != '' }}
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # create variables
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          PP_PATH=$RUNNER_TEMP/build_pp.provisionprofile
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          # import certificate and provisioning profile from secrets
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+          echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o $PP_PATH
+
+          # create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # import certificate to keychain
+          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          # apply provisioning profile
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles
+      - name: Show openssl version
+        run: |
+          openssl version
+          brew uninstall --ignore-dependencies openssl
+          rm -rf /usr/local/etc/openssl@3
+          rm -rf /usr/local/etc/openssl@1.1
+          brew install openssl@3
+          openssl version
+      - name: pre build
+        run: cd External/objective-git && script/bootstrap && script/update_libgit2 && cd ../..
+      - name: Show openssl version
+        run: |
+          openssl version
+      - name: Unlink openssl 3
+        run: |
+          brew unlink openssl@3
+      - name: Build project
+        run: xcodebuild -workspace GitX.xcworkspace -scheme GitX -archivePath ./GitX archive ARCHS="arm64" PRODUCT_BUNDLE_IDENTIFIER=net.phere.GitX
+      - name: Prepare artifact
+        if: ${{ env.variableSet != '' }}
+        env:
+          EXPORT_OPTIONS: ${{ secrets.NOTARY_EXPORT_OPTIONS }}
+        run: |
+          EXPORT_OPTIONS_PATH=$RUNNER_TEMP/ExportOptions.plist
+          echo -n "$EXPORT_OPTIONS" > $EXPORT_OPTIONS_PATH
+          echo "EXPORT_OPTIONS_PATH=$EXPORT_OPTIONS_PATH"
+          xcodebuild -exportArchive -archivePath GitX.xcarchive -exportPath . -exportOptionsPlist $EXPORT_OPTIONS_PATH
+          echo "Create GitX-arm64-${{ inputs.version_suffix }}.dmg"
+          mkdir dist && cp -R GitX.app dist/ && ln -s /Applications dist/
+          hdiutil create -fs HFS+ -srcfolder dist/ -volname "GitX-${{ inputs.version_suffix }}" GitX-arm64-${{ inputs.version_suffix }}.dmg
+          rm -rf dist
+          zip -r GitX-arm64-${{ inputs.version_suffix }}.zip GitX.app
+      - name: Notarize App
+        if: ${{ env.variableSet != '' && !inputs.skip_notarization }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          KEY_ID: ${{ secrets.APPLE_KEY_ID }}
+        run: |
+          APP_PATH="GitX.app"
+          ZIP_PATH="GitX.zip"
+          NOTARY_LOG="notary.log"
+          ID_FILE="id.txt"
+
+          ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
+
+          xcrun notarytool submit "$ZIP_PATH" --key-id $KEY_ID --apple-id $APPLE_ID --team-id $TEAM_ID --password $APPLE_PASSWORD --wait | tee "$NOTARY_LOG"
+          echo "print log output"
+          cat "$NOTARY_LOG"
+
+          ID=$(cat "$NOTARY_LOG" | tail -3 | cut -d':' -f2 | head -n 1)
+          echo "Id is: $ID"
+
+          xcrun notarytool log $ID --apple-id $APPLE_ID --team-id $TEAM_ID --password $APPLE_PASSWORD
+      - name: Staple Notarization
+        if: ${{ env.variableSet != '' && !inputs.skip_notarization }}
+        run: |
+          # While you can notarize a ZIP archive, you can't staple to it directly.
+          # Instead, run stapler against each item that you added to the archive.
+          # Then create a new ZIP file containing the stapled items for distribution.
+          # Reference: https://developer.apple.com/documentation/security/notarizing_macos_software_before_distribution/customizing_the_notarization_workflow
+          APP_PATH="GitX.app"
+          ZIP_PATH="GitX.zip"
+
+          xcrun stapler staple "$APP_PATH"
+          ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
+      - name: Check Notarization
+        if: ${{ env.variableSet != '' && !inputs.skip_notarization }}
+        run: spctl -a -vv GitX.app
+      - name: Upload dmg
+        uses: actions/upload-artifact@v6.0.0
+        if: ${{ success() }}
+        with:
+          name: GitX-arm64-${{ inputs.version_suffix }}.dmg
+          path: GitX-arm64-${{ inputs.version_suffix }}.dmg
+          overwrite: true
+      - name: Upload zip
+        uses: actions/upload-artifact@v6.0.0
+        if: ${{ success() }}
+        with:
+          name: GitX-arm64-${{ inputs.version_suffix }}.zip
+          path: GitX-arm64-${{ inputs.version_suffix }}.zip
+          overwrite: true
+      - name: Clean up keychain and provisioning profile
+        if: ${{ env.variableSet != '' }}
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db
+          rm ~/Library/MobileDevice/Provisioning\ Profiles/build_pp.provisionprofile
