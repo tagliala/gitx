@@ -144,6 +144,7 @@ jobs:
         with:
           name: GitX-arm64-${{ inputs.version_suffix }}.zip
           path: GitX-arm64-${{ inputs.version_suffix }}.zip
+          overwrite: true
       - name: Clean up keychain and provisioning profile
         if: ${{ env.variableSet != '' }}
         run: |
