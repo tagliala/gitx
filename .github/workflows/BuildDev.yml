@@ -17,9 +17,11 @@ on:
 jobs:
   build-gitx-dev:
     name: build dev version
+    runs-on: macos-26
+    permissions:
+      contents: read
     env:
       variableSet: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-    runs-on: macos-26
     strategy:
       fail-fast: false
     steps:
