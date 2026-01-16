@@ -141,6 +141,7 @@ jobs:
           overwrite: true
       - name: Upload zip
         uses: actions/upload-artifact@v6.0.0
+        if: ${{ success() }}
         with:
           name: GitX-arm64-${{ inputs.version_suffix }}.zip
           path: GitX-arm64-${{ inputs.version_suffix }}.zip
